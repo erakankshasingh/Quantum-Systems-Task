@@ -33,15 +33,17 @@ The delay/period range is validated to be within **1 to 255 seconds**, as requir
 - `std::chrono::steady_clock` for robust timeout/scheduling behavior
 
 ## Files
+```md
 - `cpp_udpScheduler_asingh.hpp` — class declaration / interface
 - `cpp_udpScheduler_asingh.cpp` — implementation
-- `main.cpp` — small demo application
+- `cpp_main_asingh.cpp` — small demo application
+```
 
 ## Build
 Compile with g++ and pthread support:
 
 ```bash
-g++ -std=c++17 udp_scheduler.cpp main.cpp -o udp_demo -pthread
+g++ -std=c++17 cpp_udpScheduler_asingh.cpp cpp_mainasingh.cpp -o udp_demo -pthread
 
 ./udp.demo
 ```
