@@ -1,0 +1,278 @@
+ASingh: Analysis Doc
+
+The code for scheduler is spilt into (.hpp + .cpp) for the submission.
+	udp_scheduler.hpp = class interface / declaration
+	udp_scheduler.cpp = implementation details
+
+cleaner separation, more maintainable, familiar professional structure for C++ projects.
+Also, because another .cpp file cannot use the class unless it can “see” its declaration.
+
+“I chose a header/source split because it keeps the public interface separate from the implementation. That makes the class easier to reuse from other translation units and follows the structure I have used in previous C++ projects.”
+
+***************
+
+What goes where
+In udp_scheduler.hpp - contains the declaration of the class → public methods, private members, function prototypes
+
+In udp_scheduler.cpp - contains the implementation/definitions of those methods → constructor/destructor definitions, send_now, send_after, send_periodic, cancel, worker_loop, udp_send, make_sockaddr, validate_range, schedule
+
+Solution final file structure
+.
+├── udp_scheduler.hpp
+├── udp_scheduler.cpp
+├── main.cpp              # optional demo/test
+└── README.md
+
+
+********************
+
+Description of the udp Scheduler interface created to handle the following tasks:
+
+1. Send immediately a measege over udp to specific ip & port
+2. Send with a non blocking request a udp message to specific ip & port after X seconds' delay (where X could be any value between 1s and 255s)
+3. Request periodic sending of a udp message to specific ip & port every  X seconds. (where X could be any value between 1s and 255s)
+
+
+There are two categories of operations:
+
+1. Immediate send
+
+	caller wants “send now” and is okay with the call doing the work.
+
+2. Scheduled sends (delayed + periodic)
+
+	caller wants a non-blocking request: “please send later / repeatedly”, return immediately.
+
+	therefore a background mechanism is needed to trigger sends at the right time.
+
+Chosen architecture
+
+	A single worker thread acts as a lightweight “scheduler”.
+
+	Scheduled jobs live in a priority queue ordered by “next due time”.
+
+	The worker sleeps until the next job is due (condition_variable::wait_until), then sends it.
+
+	Periodic jobs are reinserted with a new due time.
+
+	This is intentionally simple, deterministic, and easy to reason about.
+
+***************************
+
+Public API and semantics
+
+1. send_now(ip, port, msg) -> bool
+
+	Blocking: it performs socket() + sendto() in the caller’s thread.
+
+	Returns true if sendto() reports that it sent exactly msg.size() bytes.
+
+	Throws on invalid IPv4 address format (via inet_pton).
+
+Why return bool instead of exceptions for send failure?
+
+	In Linux/POSIX, socket() or sendto() can fail for “normal” runtime reasons (permissions, network stack issues). Returning false is a simple “best-effort” signal. Invalid inputs (bad IP) are programmer errors → exceptions make sense.
+
+2. send_after(ip, port, msg, X)
+
+	Enforces X ∈ [1,255] seconds (assignment requirement).
+
+	Creates a job of type OneShot.
+
+	Stores a copy of the payload so caller can safely destroy their buffer after returning.
+
+	Computes due = now + X and schedules it.
+
+	Returns a Handle (id) for cancellation.
+
+Non-blocking aspect: it does not wait for the send; it only enqueues work.
+
+3. send_periodic(ip, port, msg, X)
+
+	Same validation, but job type is Periodic.
+
+	First send occurs after X seconds (explicit design decision: simple and deterministic).
+
+	After each send, the job is rescheduled.
+
+There are two possible semantics:
+
+	“send immediately, then every X seconds”
+
+	“send after X seconds, then every X seconds”
+	I chose the second because it’s easiest to implement and explain; also matches “every X seconds” more literally.
+
+4. cancel(handle)
+
+	Adds the id to a cancelled_ set.
+
+	Worker thread checks this set and skips cancelled jobs.
+
+	“Safe to call multiple times”: inserting into a set is idempotent.
+
+Why a cancellation set instead of removing from the queue?
+	std::priority_queue doesn’t support efficient removal of arbitrary elements. Mark-and-skip is the simplest approach.
+
+********************************************************
+Job:
+		struct Job {
+		  Handle id;
+		  JobType type;           // OneShot or Periodic
+		  std::string ip;
+		  uint16_t port;
+		  std::vector<uint8_t> payload;
+		  seconds period;         // X seconds (also used for one-shot delay)
+		  time_point due;         // next time it should run
+		};
+
+Why store ip/port/payload inside the job?
+Because it decouples the scheduled work from caller lifetime. When it is scheduled for later, references would be unsafe.
+
+priority_queue<Job, ..., Later>
+
+Later comparator is inverted so the “smallest due time” comes out first (min-heap behavior).
+
+This ensures: worker always processes the soonest job next, which is exactly what a scheduler needs.
+
+cancelled_ set
+
+unordered_set<Handle> makes cancellation checks average O(1).
+
+Worker frequently checks cancelled_.count(id).
+
+Tradeoff: cancelled ids remain in the set; in a long-running system you’d want pruning to avoid unbounded growth. For a case study, it’s acceptable and easy to explain as a conscious simplification.
+
+******************************************************
+
+Concurrency + thread lifecycle
+Worker thread start/stop
+
+Constructor starts the worker thread immediately.
+
+Destructor signals stop, notifies, then joins.
+
+			{ lock; stop_ = true; }
+			cv_.notify_all();
+			worker_.join();
+
+
+Why this design is safe?
+
+	stop_ is protected by the same mutex the worker uses; worker wakes up promptly.
+
+	Joining guarantees no background thread accesses members after destruction (no use-after-free).
+
+	Shared state protection
+
+	pq_ and cancelled_ are guarded by mtx_.
+
+	Worker holds the lock while manipulating queue/set.
+
+	The lock is released during the actual UDP send to avoid blocking other API calls.
+
+	That last point is important: sending is fast, but still a syscall; releasing the lock keeps the API responsive.
+
+********************************************
+
+Scheduling logic in worker_loop()
+1) Skip cancelled jobs at the top --> Because we can’t remove arbitrary jobs efficiently, we discard cancelled ones when they reach the top.
+
+			while (!pq_.empty() && cancelled_.count(pq_.top().id)) pq_.pop();
+
+
+2) If no jobs, wait --> This prevents busy looping and uses OS sleep efficiently.
+
+			cv_.wait(lk, [this]{ return stop_ || !pq_.empty(); });
+
+
+3) Wait until the next due time -->
+
+			auto due = pq_.top().due;
+			cv_.wait_until(lk, due, [this]{ return stop_; });
+
+Why wait_until?
+
+It sleeps until an absolute timepoint, which is ideal for a scheduler.
+
+Uses steady_clock, so it’s not affected by wall-clock adjustments.
+
+Simplification tradeoff
+The predicate only checks stop_. If a new earlier job is enqueued, notify_all() wakes the thread, but it might just loop and recompute anyway. In practice it works because after wakeup the loop restarts and rechecks pq_.top() and due.
+
+
+4) Execute due job
+
+Once due:
+
+Copy job from top --> Pop it --> If cancelled, skip --> Unlock --> Send UDP --> Lock again
+
+Why copy instead of moving from pq_.top()?
+
+	priority_queue::top() returns const Job&. Moving from it is messy and needs hacks (const_cast), so copying keeps correctness and clarity.
+
+	Payload copy cost is acceptable for this assignment.
+
+5) Reschedule periodic job
+
+
+			job.due = Clock::now() + job.period;
+			pq_.push(std::move(job));
+
+
+Why now + period rather than old_due + period?
+
+	now + period is simpler and avoids “catch-up bursts” if send is delayed.
+
+	It introduces a small drift if sending is slow, but for a simple case study this is reasonable and easy to explain.
+
+	If asked, you can say:
+
+	“If strict cadence is needed, I would use job.due += period and handle missed deadlines carefully.”
+
+**************************************
+
+UDP send implementation details (udp_send)
+Address conversion
+	inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) validates IPv4 dotted format.
+
+	htons(port) converts host byte order to network byte order.
+
+	Send call
+
+	socket(AF_INET, SOCK_DGRAM, 0) creates a UDP socket.
+
+	sendto() sends a datagram to the target address.
+
+	Close socket immediately.
+
+	Why create a new socket every time?
+
+	It’s simple and avoids shared-socket synchronization issues.
+
+
+Null pointer safety
+
+data = msg.empty() ? nullptr : msg.data()
+and guard: if (len > 0 && data == nullptr) throw
+
+
+********************************************
+
+“Immediate send uses direct sendto for simplest synchronous behavior.”
+
+“Delayed and periodic are non-blocking by enqueueing jobs to a worker thread.”
+
+“A priority queue ensures the soonest job runs next.”
+
+“Cancellation uses mark-and-skip because priority_queue can’t remove arbitrary elements efficiently.”
+
+“I used steady_clock to avoid wall-clock jumps.”
+
+“I copy payload into the job to decouple caller lifetime.”
+
+
+*******************************************
+
+
+
+

@@ -1,0 +1,48 @@
+ASingh: Analysis of the task
+
+What the code does (1 line)
+
+It starts two threads that repeatedly run Process() while a shared atomic running flag is true, and stops both threads when either Process() returns true or a timeout since thread start is exceeded.
+
+Issues / bugs
+
+1. Data race on loop_counter1 and loop_counter2 (undefined behavior)
+
+	Both counters are plain int captured by reference and modified from worker threads without synchronization.
+
+	This is a classic thread-safety bug: concurrent access without atomic/mutex guarantees leads to undefined behavior.
+
+	FIX: Data race → counters changed to std::atomic<int> and accessed with load/fetch_add.
+
+2. Capturing Process by reference inside the thread can dangle
+
+	StartThread takes const std::function<bool(void)>& Process then the thread lambda captures by [&], meaning it uses that reference.
+
+	If Process were a temporary or otherwise went out of scope, the thread would hold a dangling reference. In this call pattern it likely “works”, but it’s a fragile lifetime bug in the utility.
+
+    FIX: Dangling Process → StartThread is templated and captures proc by value.
+
+3. Timeout logic is “cooperative” and can overshoot
+
+	Timeout is checked only after Process() returns. If Process() blocks/sleeps longer than the timeout, the thread won’t stop at the deadline; it stops only after the blocking call finishes.
+
+	FIX: Cooperative timeout overshoot → clarified: this design is still cooperative; you cannot preempt a blocking sleep_for. (If you must enforce hard timeout, you need interruptible waits / condition_variable, or break sleep into chunks.)
+
+4. Clock choice for elapsed time is not robust
+
+	Uses high_resolution_clock, which is not guaranteed to be steady/monotonic on all platforms. For timeout/elapsed time measurement this can be incorrect if the clock jumps.
+
+	FIX: Clock robustness → steady_clock.
+
+5. Type-mismatch / awkward duration comparison
+
+	duration is cast to milliseconds and compared to timeout in seconds. This relies on implicit duration conversions during comparison; it’s error-prone and reduces clarity.
+
+    FIX: Duration mismatch → compare (now - start) > timeout directly.
+
+6.Potential std::terminate() if StartThread is called on an already-running thread
+
+	Assigning a new std::thread into an existing joinable std::thread object causes std::terminate(). In this main it’s fine (default-constructed threads), but as a generic helper it’s unsafe.
+
+	FIX: std::terminate risk → check thread.joinable() and throw.
+

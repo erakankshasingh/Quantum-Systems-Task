@@ -1,0 +1,76 @@
+ASingh: Analysis of the python task
+
+Why the application breaks and throws error:
+
+	Error:
+	Testcase failed. Actual vs. Expected:
+	[13, 9, 5, 13]   [13, 9, 5, 1]
+	[14, 10, 10, 9]  [14, 10, 6, 2]
+	[15, 11, 10, 5]  [15, 11, 7, 3]
+	[16, 5, 9, 13]   [16, 12, 8, 4]
+
+	Testcase failed. Actual vs. Expected:
+	[43, 36, 29, 22, 15, 8, 43]  [43, 36, 29, 22, 15, 8, 1]
+	[44, 37, 30, 23, 16, 37, 36] [44, 37, 30, 23, 16, 9, 2]
+	[45, 38, 31, 24, 31, 30, 29] [45, 38, 31, 24, 17, 10, 3]
+	[46, 39, 32, 25, 24, 23, 22] [46, 39, 32, 25, 18, 11, 4]
+	[47, 40, 33, 24, 31, 16, 15] [47, 40, 33, 26, 19, 12, 5]
+	[48, 41, 16, 23, 30, 37, 8]  [48, 41, 34, 27, 20, 13, 6]
+	[49, 8, 15, 22, 29, 36, 43]  [49, 42, 35, 28, 21, 14, 7]
+
+The code overwrites values while still needing them later. So after the first few assignments, the original matrix data is already corrupted.
+
+		matrix[r][c] = matrix[n-c-1][r]
+
+It copies from a position that may already have been modified earlier in the loop. So it is not safe for in-place rotation.
+
+********************************	
+
+For a 90-degree rotation, each new value depends on the original matrix layout.
+But after the first assignment, part of the matrix is already changed. 
+
+The code is reading from the same matrix that it is simultaneously modifying, without saving the old values first.
+
+Example of the problem
+
+Suppose it writes into matrix[0][0] first.
+Later, some other cell may need the old value of matrix[0][0], but that value is already gone.
+
+
+To rotate in place safely:
+
+	either use a temporary copy of the matrix,
+
+	or rotate 4 corresponding cells at a time while temporarily saving one value.
+
+*************************
+
+What fixed version does?
+It rotates the matrix in rings/layers:
+
+outer layer first
+
+then inner layer
+
+for each position, it rotates:
+
+left → top
+
+bottom → left
+
+right → bottom
+
+saved top → right
+
+That preserves all values correctly.
+
+Expected result
+
+*********************
+With this fix, both provided test cases should print:
+
+Testcase OK!
+Testcase OK!
+
+
+
